@@ -1,0 +1,1083 @@
+from __future__ import annotations
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from time import perf_counter
+import os
+
+import numpy as np
+import pandas as pd
+
+
+STRONG_RAIN_MM_H = 3.0
+
+# Optional pixel-alert row limit for responsive map popups.
+_DEFAULT_MAX_PIXELS_RAW = os.environ.get("CURRENT_ALERTS_MAX_PIXELS_PER_BASIN", "").strip()
+try:
+    DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT = int(_DEFAULT_MAX_PIXELS_RAW) if _DEFAULT_MAX_PIXELS_RAW else None
+except ValueError:
+    DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT = None
+if DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT is not None and DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT <= 0:
+    DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT = None
+
+
+ALERT_RANK = {
+    "NORMAL": 0,
+    "WATCH": 1,
+    "WARNING": 2,
+    "SEVERE": 3,
+}
+
+# Operational classes used by the app legend/map.
+# Keep these names stable; the Tethys app can color by operational_alert_level.
+OPERATIONAL_ALERT_RANK = {
+    "NORMAL": 0,
+    "WATCH": 1,
+    "WARNING": 2,
+    "BASIN_FLOOD": 3,
+    "SEVERE_UNKNOWN_RESPONSE": 3,
+    "FLASH_FLOOD_6H": 4,
+    "FLASH_FLOOD_4H": 5,
+    "FLASH_FLOOD_3H": 6,
+    "FLASH_FLOOD_2H": 7,
+    "FLASH_FLOOD_1H": 8,
+}
+
+OPERATIONAL_ALERT_LABEL = {
+    "NORMAL": "Normal",
+    "WATCH": "Watch",
+    "WARNING": "Warning",
+    "BASIN_FLOOD": "Basin Flood (>6h)",
+    "SEVERE_UNKNOWN_RESPONSE": "Severe (unknown response)",
+    "FLASH_FLOOD_6H": "Flash Flood ≤6h",
+    "FLASH_FLOOD_4H": "Flash Flood ≤4h",
+    "FLASH_FLOOD_3H": "Flash Flood ≤3h",
+    "FLASH_FLOOD_2H": "Flash Flood ≤2h",
+    "FLASH_FLOOD_1H": "Flash Flood ≤1h",
+}
+
+# Suggested default colors. The app can use these directly or override them in JS/CSS.
+OPERATIONAL_ALERT_COLOR = {
+    "NORMAL": "#bdbdbd",
+    "WATCH": "#ffff99",
+    "WARNING": "#fdae61",
+    "BASIN_FLOOD": "#756bb1",
+    "SEVERE_UNKNOWN_RESPONSE": "#636363",
+    "FLASH_FLOOD_6H": "#fdbb84",
+    "FLASH_FLOOD_4H": "#fc8d59",
+    "FLASH_FLOOD_3H": "#ef6548",
+    "FLASH_FLOOD_2H": "#d7301f",
+    "FLASH_FLOOD_1H": "#7f0000",
+}
+
+_WORKER_STATE: dict = {}
+
+
+# =============================================================================
+# Loaders and validators
+# =============================================================================
+def load_npz(fp: Path) -> dict:
+    fp = Path(fp)
+    if not fp.exists():
+        raise FileNotFoundError(f"NPZ file not found: {fp}")
+    z = np.load(fp, allow_pickle=True)
+    return {k: z[k] for k in z.files}
+
+
+def load_state_basin_index(fp: Path) -> dict:
+    z = np.load(fp, allow_pickle=True)
+    return {
+        "state": str(z["state"]),
+        "site_ids": z["site_ids"].astype(str),
+        "rows": z["rows"].astype(np.int32),
+        "cols": z["cols"].astype(np.int32),
+        "lon": z["lon"].astype(np.float32),
+        "lat": z["lat"].astype(np.float32),
+        "basin_ptr": z["basin_ptr"].astype(np.int64),
+        "basin_indices": z["basin_indices"].astype(np.int32),
+        "basin_n_pixels": z["basin_n_pixels"].astype(np.int32),
+        "n_basins": int(z["n_basins"]),
+        "n_state_pixels": int(z["n_state_pixels"]),
+    }
+
+
+def load_current_state_rain(fp: Path) -> dict:
+    z = np.load(fp, allow_pickle=True)
+    rain = z["rain"].astype(np.float32)
+    if rain.ndim != 2:
+        raise ValueError(f"Expected rain with shape (time, n_state_pixels), got {rain.shape}")
+    return {
+        "state": str(z["state"]) if "state" in z.files else None,
+        "rain": rain,
+        "time": z["time"] if "time" in z.files else None,
+        "rows": z["rows"].astype(np.int32) if "rows" in z.files else None,
+        "cols": z["cols"].astype(np.int32) if "cols" in z.files else None,
+        "lat": z["lat"].astype(np.float32) if "lat" in z.files else None,
+        "lon": z["lon"].astype(np.float32) if "lon" in z.files else None,
+        "missing_times": z["missing_times"] if "missing_times" in z.files else None,
+    }
+
+
+def validate_efficient_reference(efficient_ref: dict, basin_idx: dict, state: str) -> None:
+    required = [
+        "state", "site_ids", "min_events", "ref_ptr", "pixel_ref", "basin_ref", "delta_ref",
+        "n_events_all", "n_events_rain_response", "n_events_good",
+        "corr_pixel_delta", "corr_basin_delta", "corr_combined_delta",
+        "pixel_weight", "basin_weight",
+        "pixel_p50", "pixel_p75", "pixel_p90", "basin_p50", "basin_p75", "basin_p90",
+        "delta_p50", "delta_p75", "delta_p90", "p50_eff_pixel", "p50_eff_basin",
+        "basin_peak_time", "pixel_peak_time", "max_delta_basin_peak_time", "max_delta_pixel_peak_time",
+        "fastest_event_id", "fastest_response_hr", "fastest_delta_water_stage",
+        "fastest_basin_accumulation", "fastest_pixel_accumulation",
+        "max_delta_event_id", "max_delta_response_hr", "max_delta_water_stage",
+        "max_delta_basin_accumulation", "max_delta_pixel_accumulation",
+    ]
+    missing = [k for k in required if k not in efficient_ref]
+    if missing:
+        raise ValueError("efficient_event_reference_npz is missing required arrays: " + ", ".join(missing))
+
+    ref_state = str(efficient_ref["state"])
+    if ref_state.upper() != state.upper():
+        raise ValueError(f"Efficient reference state mismatch. expected={state}, found={ref_state}")
+
+    ref_site_ids = efficient_ref["site_ids"].astype(str)
+    basin_site_ids = basin_idx["site_ids"].astype(str)
+
+    if len(ref_site_ids) != len(basin_site_ids):
+        raise ValueError(
+            f"Efficient reference site count mismatch. reference={len(ref_site_ids)}, "
+            f"basin_index={len(basin_site_ids)}"
+        )
+    if not np.array_equal(ref_site_ids, basin_site_ids):
+        raise ValueError(
+            "Efficient reference site_ids do not match state_basin_index site_ids. "
+            "Rebuild the efficient reference with the same state_basin_index."
+        )
+
+    ref_ptr = efficient_ref["ref_ptr"].astype(np.int64)
+    if len(ref_ptr) != len(ref_site_ids) + 1:
+        raise ValueError(f"Invalid ref_ptr length. expected={len(ref_site_ids) + 1}, found={len(ref_ptr)}")
+    if int(ref_ptr[-1]) != len(efficient_ref["pixel_ref"]):
+        raise ValueError(
+            f"Invalid efficient reference pointer. ref_ptr[-1]={int(ref_ptr[-1])}, "
+            f"pixel_ref length={len(efficient_ref['pixel_ref'])}"
+        )
+    if len(efficient_ref["pixel_ref"]) != len(efficient_ref["basin_ref"]):
+        raise ValueError("Efficient reference pixel_ref and basin_ref lengths do not match")
+    if len(efficient_ref["pixel_ref"]) != len(efficient_ref["delta_ref"]):
+        raise ValueError("Efficient reference pixel_ref and delta_ref lengths do not match")
+
+
+def build_event_lookup(pixel_event_index: dict) -> dict[int, int]:
+    pixel_id_state = pixel_event_index["pixel_id_state"].astype(np.int32)
+    return {int(pid): i for i, pid in enumerate(pixel_id_state)}
+
+
+# =============================================================================
+# Classification helpers
+# =============================================================================
+def percentile_rank(value: float, reference: np.ndarray) -> float:
+    reference = np.asarray(reference, dtype=np.float32)
+    reference = reference[np.isfinite(reference)]
+    if reference.size == 0 or not np.isfinite(value):
+        return np.nan
+    return float(100.0 * np.mean(reference <= value))
+
+
+def classify_percentile_alert(percentile_value: float) -> str:
+    if not np.isfinite(percentile_value):
+        return "NORMAL"
+    if percentile_value >= 90.0:
+        return "SEVERE"
+    if percentile_value >= 75.0:
+        return "WARNING"
+    if percentile_value >= 50.0:
+        return "WATCH"
+    return "NORMAL"
+
+
+def classify_efficient_event_alert(
+    *,
+    current_pixel: float,
+    current_basin: float,
+    pixel_p50: float,
+    pixel_p75: float,
+    pixel_p90: float,
+    basin_p50: float,
+    basin_p75: float,
+    basin_p90: float,
+    pixel_pct: float,
+    basin_pct: float,
+    weighted_pct: float,
+) -> tuple[str, str]:
+    pixel_ge_p90 = np.isfinite(current_pixel) and np.isfinite(pixel_p90) and current_pixel >= pixel_p90
+    pixel_ge_p75 = np.isfinite(current_pixel) and np.isfinite(pixel_p75) and current_pixel >= pixel_p75
+    pixel_ge_p50 = np.isfinite(current_pixel) and np.isfinite(pixel_p50) and current_pixel >= pixel_p50
+
+    basin_ge_p90 = np.isfinite(current_basin) and np.isfinite(basin_p90) and current_basin >= basin_p90
+    basin_ge_p75 = np.isfinite(current_basin) and np.isfinite(basin_p75) and current_basin >= basin_p75
+    basin_ge_p50 = np.isfinite(current_basin) and np.isfinite(basin_p50) and current_basin >= basin_p50
+
+    weighted_warning = np.isfinite(weighted_pct) and weighted_pct >= 75.0
+    weighted_watch = np.isfinite(weighted_pct) and weighted_pct >= 50.0
+
+    if pixel_ge_p90 and basin_ge_p75:
+        return "SEVERE", "PIXEL_GE_P90_AND_BASIN_GE_P75"
+    if pixel_ge_p90:
+        return "WARNING", "PIXEL_GE_P90_ONLY"
+    if basin_ge_p90:
+        return "WARNING", "BASIN_GE_P90_ONLY"
+    if pixel_ge_p75 or basin_ge_p75 or weighted_warning:
+        return "WARNING", "PIXEL_OR_BASIN_GE_P75_OR_WEIGHTED_P75"
+    if pixel_ge_p50 or basin_ge_p50 or weighted_watch:
+        return "WATCH", "PIXEL_OR_BASIN_GE_P50_OR_WEIGHTED_P50"
+    return "NORMAL", "BELOW_P50"
+
+
+def classify_operational_alert(alert_level: str, response_hr: float) -> tuple[str, str]:
+    """
+    Operational class for map coloring / legend.
+
+    Only SEVERE basins are split by response time. Response <= 6 h is flash-flood
+    timing; SEVERE basins slower than 6 h are BASIN_FLOOD.
+    """
+    if alert_level != "SEVERE":
+        return alert_level, "NON_SEVERE_ALERT"
+    if not np.isfinite(response_hr):
+        return "SEVERE_UNKNOWN_RESPONSE", "SEVERE_NO_RESPONSE_TIME"
+    if response_hr <= 1.0:
+        return "FLASH_FLOOD_1H", "SEVERE_RESPONSE_LE_1H"
+    if response_hr <= 2.0:
+        return "FLASH_FLOOD_2H", "SEVERE_RESPONSE_LE_2H"
+    if response_hr <= 3.0:
+        return "FLASH_FLOOD_3H", "SEVERE_RESPONSE_LE_3H"
+    if response_hr <= 4.0:
+        return "FLASH_FLOOD_4H", "SEVERE_RESPONSE_LE_4H"
+    if response_hr <= 6.0:
+        return "FLASH_FLOOD_6H", "SEVERE_RESPONSE_LE_6H"
+    return "BASIN_FLOOD", "SEVERE_RESPONSE_GT_6H"
+
+
+def recover_operational_response_hr(
+    *,
+    efficient_response_hr: float,
+    hist: dict,
+    all_hist_idx: np.ndarray,
+) -> tuple[float, str]:
+    """
+    Response-time fallback used for operational classification.
+
+    The efficient reference may store NaN when historical response time was negative.
+    The app popup can still recover/correct response time from the pixel-event index.
+    Here we do the same at basin-alert level:
+      1. use efficient fastest_response_hr when finite and positive;
+      2. otherwise use the minimum positive time_to_stage_peak_hr from active historical pixels;
+      3. if no positive values exist, use the smallest absolute non-zero finite time_to_stage_peak_hr.
+    """
+    if np.isfinite(efficient_response_hr) and efficient_response_hr > 0:
+        return float(efficient_response_hr), "efficient_fastest_response_hr"
+
+    if all_hist_idx.size == 0 or "time_to_stage_peak_hr" not in hist:
+        return np.nan, "missing_time_to_stage_peak_hr"
+
+    vals = hist["time_to_stage_peak_hr"][all_hist_idx].astype(np.float32)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan, "no_finite_time_to_stage_peak_hr"
+
+    positive = vals[vals > 0]
+    if positive.size:
+        return float(np.nanmin(positive)), "pixel_event_index_min_positive_time_to_stage_peak_hr"
+
+    nonzero_abs = np.abs(vals[vals != 0])
+    if nonzero_abs.size:
+        return float(np.nanmin(nonzero_abs)), "pixel_event_index_min_abs_time_to_stage_peak_hr"
+
+    return np.nan, "no_valid_time_to_stage_peak_hr"
+
+
+# =============================================================================
+# Efficient reference
+# =============================================================================
+def _empty_cached_efficient_alerts() -> dict:
+    return {
+        "efficient_history_ok": False,
+        "efficient_n_events_all": 0,
+        "efficient_n_events_rain_response": 0,
+        "efficient_n_events_good": 0,
+        "efficient_corr_pixel_delta": np.nan,
+        "efficient_corr_basin_delta": np.nan,
+        "efficient_corr_combined_delta": np.nan,
+        "efficient_pixel_weight": np.nan,
+        "efficient_basin_weight": np.nan,
+        "efficient_pixel_ref_p50": np.nan,
+        "efficient_pixel_ref_p75": np.nan,
+        "efficient_pixel_ref_p90": np.nan,
+        "efficient_basin_ref_p50": np.nan,
+        "efficient_basin_ref_p75": np.nan,
+        "efficient_basin_ref_p90": np.nan,
+        "efficient_delta_ref_p50": np.nan,
+        "efficient_delta_ref_p75": np.nan,
+        "efficient_delta_ref_p90": np.nan,
+        "efficient_p50_eff_pixel": np.nan,
+        "efficient_p50_eff_basin": np.nan,
+        "efficient_pixel_percentile": np.nan,
+        "efficient_basin_percentile": np.nan,
+        "efficient_max_percentile": np.nan,
+        "efficient_avg_percentile": np.nan,
+        "efficient_weighted_percentile": np.nan,
+        "efficient_pixel_level": "NORMAL",
+        "efficient_basin_level": "NORMAL",
+        "efficient_max_level": "NORMAL",
+        "efficient_avg_level": "NORMAL",
+        "efficient_weighted_level": "NORMAL",
+        "historical_fastest_event_id": np.nan,
+        "historical_fastest_response_hr": np.nan,
+        "historical_fastest_delta_water_stage": np.nan,
+        "historical_fastest_basin_accumulation": np.nan,
+        "historical_fastest_pixel_accumulation": np.nan,
+        "historical_max_delta_event_id": np.nan,
+        "historical_max_delta_response_hr": np.nan,
+        "historical_max_delta_water_stage": np.nan,
+        "historical_max_delta_basin_accumulation": np.nan,
+        "historical_max_delta_pixel_accumulation": np.nan,
+        "basin_peak_time": np.nan,
+        "pixel_peak_time": np.nan,
+        "max_delta_basin_peak_time": np.nan,
+        "max_delta_pixel_peak_time": np.nan,
+    }
+
+
+def efficient_percentile_alerts_from_cached_ref(
+    *,
+    site_index: int,
+    current_basin_accumulation: float,
+    current_max_pixel_accumulation: float,
+    efficient_ref: dict,
+) -> dict:
+    out = _empty_cached_efficient_alerts()
+
+    site_index = int(site_index)
+    ref_ptr = efficient_ref["ref_ptr"].astype(np.int64)
+    if site_index < 0 or site_index >= len(ref_ptr) - 1:
+        return out
+
+    h0 = int(ref_ptr[site_index])
+    h1 = int(ref_ptr[site_index + 1])
+
+    n_events_all = int(efficient_ref["n_events_all"][site_index])
+    n_events_rain_response = int(efficient_ref["n_events_rain_response"][site_index])
+    n_events_good = int(efficient_ref["n_events_good"][site_index])
+
+    pixel_ref = efficient_ref["pixel_ref"][h0:h1].astype(np.float32)
+    basin_ref = efficient_ref["basin_ref"][h0:h1].astype(np.float32)
+    history_ok = bool(n_events_good > 0 and pixel_ref.size > 0 and basin_ref.size > 0)
+
+    pixel_weight = float(efficient_ref["pixel_weight"][site_index])
+    basin_weight = float(efficient_ref["basin_weight"][site_index])
+
+    pixel_pct = basin_pct = max_pct = avg_pct = weighted_pct = np.nan
+    if history_ok:
+        pixel_pct = percentile_rank(current_max_pixel_accumulation, pixel_ref)
+        basin_pct = percentile_rank(current_basin_accumulation, basin_ref)
+        max_pct = float(np.nanmax([pixel_pct, basin_pct]))
+        avg_pct = float(np.nanmean([pixel_pct, basin_pct]))
+
+        if not np.isfinite(pixel_weight) or not np.isfinite(basin_weight) or (pixel_weight + basin_weight) <= 0:
+            pixel_weight = basin_weight = 0.5
+        weighted_pct = float(pixel_weight * pixel_pct + basin_weight * basin_pct)
+
+    out.update(
+        {
+            "efficient_history_ok": history_ok,
+            "efficient_n_events_all": n_events_all,
+            "efficient_n_events_rain_response": n_events_rain_response,
+            "efficient_n_events_good": n_events_good,
+            "efficient_corr_pixel_delta": float(efficient_ref["corr_pixel_delta"][site_index]),
+            "efficient_corr_basin_delta": float(efficient_ref["corr_basin_delta"][site_index]),
+            "efficient_corr_combined_delta": float(efficient_ref["corr_combined_delta"][site_index]),
+            "efficient_pixel_weight": float(pixel_weight),
+            "efficient_basin_weight": float(basin_weight),
+            "efficient_pixel_ref_p50": float(efficient_ref["pixel_p50"][site_index]),
+            "efficient_pixel_ref_p75": float(efficient_ref["pixel_p75"][site_index]),
+            "efficient_pixel_ref_p90": float(efficient_ref["pixel_p90"][site_index]),
+            "efficient_basin_ref_p50": float(efficient_ref["basin_p50"][site_index]),
+            "efficient_basin_ref_p75": float(efficient_ref["basin_p75"][site_index]),
+            "efficient_basin_ref_p90": float(efficient_ref["basin_p90"][site_index]),
+            "efficient_delta_ref_p50": float(efficient_ref["delta_p50"][site_index]),
+            "efficient_delta_ref_p75": float(efficient_ref["delta_p75"][site_index]),
+            "efficient_delta_ref_p90": float(efficient_ref["delta_p90"][site_index]),
+            "efficient_p50_eff_pixel": float(efficient_ref["p50_eff_pixel"][site_index]),
+            "efficient_p50_eff_basin": float(efficient_ref["p50_eff_basin"][site_index]),
+            "efficient_pixel_percentile": pixel_pct,
+            "efficient_basin_percentile": basin_pct,
+            "efficient_max_percentile": max_pct,
+            "efficient_avg_percentile": avg_pct,
+            "efficient_weighted_percentile": weighted_pct,
+            "efficient_pixel_level": classify_percentile_alert(pixel_pct),
+            "efficient_basin_level": classify_percentile_alert(basin_pct),
+            "efficient_max_level": classify_percentile_alert(max_pct),
+            "efficient_avg_level": classify_percentile_alert(avg_pct),
+            "efficient_weighted_level": classify_percentile_alert(weighted_pct),
+            "historical_fastest_event_id": int(efficient_ref["fastest_event_id"][site_index]),
+            "historical_fastest_response_hr": float(efficient_ref["fastest_response_hr"][site_index]),
+            "historical_fastest_delta_water_stage": float(efficient_ref["fastest_delta_water_stage"][site_index]),
+            "historical_fastest_basin_accumulation": float(efficient_ref["fastest_basin_accumulation"][site_index]),
+            "historical_fastest_pixel_accumulation": float(efficient_ref["fastest_pixel_accumulation"][site_index]),
+            "historical_max_delta_event_id": int(efficient_ref["max_delta_event_id"][site_index]),
+            "historical_max_delta_response_hr": float(efficient_ref["max_delta_response_hr"][site_index]),
+            "historical_max_delta_water_stage": float(efficient_ref["max_delta_water_stage"][site_index]),
+            "historical_max_delta_basin_accumulation": float(efficient_ref["max_delta_basin_accumulation"][site_index]),
+            "historical_max_delta_pixel_accumulation": float(efficient_ref["max_delta_pixel_accumulation"][site_index]),
+            "basin_peak_time": float(efficient_ref["basin_peak_time"][site_index]),
+            "pixel_peak_time": float(efficient_ref["pixel_peak_time"][site_index]),
+            "max_delta_basin_peak_time": float(efficient_ref["max_delta_basin_peak_time"][site_index]),
+            "max_delta_pixel_peak_time": float(efficient_ref["max_delta_pixel_peak_time"][site_index]),
+        }
+    )
+    return out
+
+
+def empty_efficient_alerts() -> dict:
+    return _empty_cached_efficient_alerts()
+
+
+# =============================================================================
+# Basin and pixel processing
+# =============================================================================
+def _normal_basin_row(
+    *,
+    state: str,
+    site_id: str,
+    current_basin_accumulation: float,
+    current_max_pixel_value: float,
+    current_max_pixel_accumulation: float,
+    n_basin_pixels: int,
+    strong_threshold: float,
+    accumulation_quantile: float,
+) -> dict:
+    operational_level = "NORMAL"
+    return {
+        "state": state,
+        "site_id": site_id,
+        "alert_level": "NORMAL",
+        "operational_alert_level": operational_level,
+        "operational_alert_label": OPERATIONAL_ALERT_LABEL[operational_level],
+        "operational_alert_color": OPERATIONAL_ALERT_COLOR[operational_level],
+        "operational_decision_reason": "NON_SEVERE_ALERT",
+        "operational_response_hr": np.nan,
+        "operational_response_source": "not_severe",
+        "legacy_alert_level": "NOT_COMPUTED",
+        "efficient_decision_reason": "NO_STRONG_CURRENT_PIXEL",
+        "current_basin_accumulation": current_basin_accumulation,
+        "current_max_pixel_value": current_max_pixel_value,
+        "current_max_pixel_accumulation": current_max_pixel_accumulation,
+        "n_basin_pixels": int(n_basin_pixels),
+        "n_active_pixels": 0,
+        "n_active_pixels_with_history": 0,
+        "active_pixel_fraction": 0.0,
+        "historical_basin_accumulation_threshold": np.nan,
+        "basin_accumulation_reaches_history": False,
+        "strong_threshold": strong_threshold,
+        "accumulation_quantile": accumulation_quantile,
+        **empty_efficient_alerts(),
+    }
+
+
+def _collect_active_history_indices(
+    *,
+    basin_i: int,
+    basin_pixels: np.ndarray,
+    active_local: np.ndarray,
+    hist: dict,
+    hist_lookup: dict[int, int],
+) -> tuple[list[tuple[int, np.ndarray]], np.ndarray, np.ndarray]:
+    active_pixels_with_history = []
+    historical_basin_acc_values = []
+
+    for local_j in active_local:
+        pixel_id_state = int(basin_pixels[local_j])
+        hist_i = hist_lookup.get(pixel_id_state)
+        if hist_i is None:
+            continue
+
+        h0 = int(hist["event_ptr"][hist_i])
+        h1 = int(hist["event_ptr"][hist_i + 1])
+        if h1 <= h0:
+            continue
+
+        site_mask = hist["site_index"][h0:h1] == basin_i
+        if not np.any(site_mask):
+            continue
+
+        idx0 = h0 + np.flatnonzero(site_mask)
+        historical_basin_acc_values.append(hist["basin_accumulation"][idx0])
+        active_pixels_with_history.append((int(local_j), idx0))
+
+    all_hist_idx = (
+        np.concatenate([idx0 for _, idx0 in active_pixels_with_history]).astype(np.int64)
+        if active_pixels_with_history
+        else np.array([], dtype=np.int64)
+    )
+    historical_basin_acc_all = (
+        np.concatenate(historical_basin_acc_values).astype(np.float32)
+        if historical_basin_acc_values
+        else np.array([], dtype=np.float32)
+    )
+    return active_pixels_with_history, historical_basin_acc_all, all_hist_idx
+
+
+def _make_pixel_records(
+    *,
+    state: str,
+    site_id: str,
+    basin_i: int,
+    basin_pixels: np.ndarray,
+    active_pixels_with_history: list[tuple[int, np.ndarray]],
+    basin_idx: dict,
+    hist: dict,
+    cur_pixel_value: np.ndarray,
+    cur_pixel_accum: np.ndarray,
+    current_basin_accumulation: float,
+    historical_basin_acc_threshold: float,
+    efficient_alerts: dict,
+    max_pixels_per_basin_output: int | None,
+) -> list[dict]:
+    selected_active_pixels = active_pixels_with_history
+    if max_pixels_per_basin_output is not None and len(selected_active_pixels) > max_pixels_per_basin_output:
+        selected_active_pixels = sorted(
+            selected_active_pixels,
+            key=lambda item: (float(cur_pixel_accum[item[0]]), float(cur_pixel_value[item[0]])),
+            reverse=True,
+        )[:max_pixels_per_basin_output]
+
+    rows = []
+    for local_j, idx0 in selected_active_pixels:
+        pixel_id_state = int(basin_pixels[local_j])
+
+        hist_delta = hist["delta_water_stage"][idx0].astype(np.float32)
+        hist_event = hist["event_id"][idx0].astype(np.int64)
+        hist_basin = hist["basin_accumulation"][idx0].astype(np.float32)
+        hist_pix_acc = hist["pixel_accumulation"][idx0].astype(np.float32)
+        hist_time_stage = hist["time_to_stage_peak_hr"][idx0].astype(np.float32) if "time_to_stage_peak_hr" in hist else np.array([], dtype=np.float32)
+
+        if hist_delta.size:
+            best_pos = int(np.nanargmax(hist_delta))
+            best_event_id = int(hist_event[best_pos])
+            best_delta = float(hist_delta[best_pos])
+            best_hist_basin = float(hist_basin[best_pos])
+            best_hist_pixel = float(hist_pix_acc[best_pos])
+            best_time_to_stage = float(hist_time_stage[best_pos]) if hist_time_stage.size else np.nan
+        else:
+            best_event_id = np.nan
+            best_delta = np.nan
+            best_hist_basin = np.nan
+            best_hist_pixel = np.nan
+            best_time_to_stage = np.nan
+
+        rows.append(
+            {
+                "state": state,
+                "site_id": site_id,
+                "pixel_id_state": pixel_id_state,
+                "pixel_id_basin": int(local_j),
+                "row": int(basin_idx["rows"][pixel_id_state]),
+                "col": int(basin_idx["cols"][pixel_id_state]),
+                "lat": float(basin_idx["lat"][pixel_id_state]),
+                "lon": float(basin_idx["lon"][pixel_id_state]),
+                "current_pixel_value": float(cur_pixel_value[local_j]),
+                "current_pixel_accumulation": float(cur_pixel_accum[local_j]),
+                "current_basin_accumulation": current_basin_accumulation,
+                "historical_basin_accumulation_threshold": historical_basin_acc_threshold,
+                "historical_pixel_best_event_id": best_event_id,
+                "historical_pixel_best_delta_water_stage": best_delta,
+                "historical_pixel_best_basin_accumulation": best_hist_basin,
+                "historical_pixel_best_pixel_accumulation": best_hist_pixel,
+                "historical_pixel_best_time_to_stage_peak_hr": best_time_to_stage,
+                "efficient_pixel_percentile": efficient_alerts["efficient_pixel_percentile"],
+                "efficient_basin_percentile": efficient_alerts["efficient_basin_percentile"],
+                "efficient_weighted_percentile": efficient_alerts["efficient_weighted_percentile"],
+            }
+        )
+
+    if rows and max_pixels_per_basin_output is not None:
+        rows = sorted(rows, key=lambda r: (r["current_pixel_accumulation"], r["current_pixel_value"]), reverse=True)[:max_pixels_per_basin_output]
+    return rows
+
+
+def _process_one_basin(
+    *,
+    basin_i: int,
+    site_id: str,
+    state: str,
+    basin_idx: dict,
+    hist: dict,
+    hist_lookup: dict[int, int],
+    efficient_ref: dict,
+    current_pixel_value_state: np.ndarray,
+    current_pixel_accum_state: np.ndarray,
+    strong_threshold: float,
+    k_matches: int,
+    accumulation_quantile: float,
+    severe_delta_threshold: float,
+    warning_delta_threshold: float,
+    max_pixels_per_basin_output: int | None,
+) -> tuple[dict | None, list[dict], bool]:
+    basin_ptr = basin_idx["basin_ptr"]
+    basin_indices = basin_idx["basin_indices"]
+
+    a = int(basin_ptr[basin_i])
+    b = int(basin_ptr[basin_i + 1])
+    basin_pixels = basin_indices[a:b]
+    if len(basin_pixels) == 0:
+        return None, [], False
+
+    cur_pixel_value = current_pixel_value_state[basin_pixels]
+    cur_pixel_accum = current_pixel_accum_state[basin_pixels]
+
+    current_basin_accumulation = float(cur_pixel_accum.sum())
+    current_max_pixel_value = float(cur_pixel_value.max())
+    current_max_pixel_accumulation = float(cur_pixel_accum.max())
+
+    active_local = np.flatnonzero(cur_pixel_value > strong_threshold)
+    n_active_pixels = int(len(active_local))
+    n_basin_pixels = int(len(basin_pixels))
+    active_pixel_fraction = float(n_active_pixels / n_basin_pixels) if n_basin_pixels else 0.0
+
+    if n_active_pixels == 0:
+        basin_row = _normal_basin_row(
+            state=state,
+            site_id=site_id,
+            current_basin_accumulation=current_basin_accumulation,
+            current_max_pixel_value=current_max_pixel_value,
+            current_max_pixel_accumulation=current_max_pixel_accumulation,
+            n_basin_pixels=n_basin_pixels,
+            strong_threshold=strong_threshold,
+            accumulation_quantile=accumulation_quantile,
+        )
+        return basin_row, [], True
+
+    efficient_alerts = efficient_percentile_alerts_from_cached_ref(
+        site_index=basin_i,
+        current_basin_accumulation=current_basin_accumulation,
+        current_max_pixel_accumulation=current_max_pixel_accumulation,
+        efficient_ref=efficient_ref,
+    )
+
+    pixel_pct = efficient_alerts["efficient_pixel_percentile"]
+    basin_pct = efficient_alerts["efficient_basin_percentile"]
+    weighted_pct = efficient_alerts["efficient_weighted_percentile"]
+
+    if current_max_pixel_value < strong_threshold:
+        alert_level = "NORMAL"
+        efficient_decision_reason = "NO_STRONG_CURRENT_PIXEL"
+    elif efficient_alerts["efficient_history_ok"]:
+        alert_level, efficient_decision_reason = classify_efficient_event_alert(
+            current_pixel=current_max_pixel_accumulation,
+            current_basin=current_basin_accumulation,
+            pixel_p50=efficient_ref["pixel_p50"][basin_i],
+            pixel_p75=efficient_ref["pixel_p75"][basin_i],
+            pixel_p90=efficient_ref["pixel_p90"][basin_i],
+            basin_p50=efficient_ref["basin_p50"][basin_i],
+            basin_p75=efficient_ref["basin_p75"][basin_i],
+            basin_p90=efficient_ref["basin_p90"][basin_i],
+            pixel_pct=pixel_pct,
+            basin_pct=basin_pct,
+            weighted_pct=weighted_pct,
+        )
+    else:
+        alert_level = "WATCH"
+        efficient_decision_reason = "FALLBACK_WATCH_NO_CACHED_EFFICIENT_HISTORY"
+
+    legacy_alert_level = "NOT_COMPUTED"
+    active_pixels_with_history = []
+    historical_basin_accumulation_threshold = np.nan
+    basin_accumulation_reaches_history = False
+    pixel_records = []
+    all_hist_idx = np.array([], dtype=np.int64)
+
+    if alert_level == "SEVERE":
+        active_pixels_with_history, historical_basin_acc_all, all_hist_idx = _collect_active_history_indices(
+            basin_i=basin_i,
+            basin_pixels=basin_pixels,
+            active_local=active_local,
+            hist=hist,
+            hist_lookup=hist_lookup,
+        )
+
+        if historical_basin_acc_all.size:
+            historical_basin_accumulation_threshold = float(np.nanquantile(historical_basin_acc_all, accumulation_quantile))
+            basin_accumulation_reaches_history = current_basin_accumulation >= historical_basin_accumulation_threshold
+
+        pixel_records = _make_pixel_records(
+            state=state,
+            site_id=site_id,
+            basin_i=basin_i,
+            basin_pixels=basin_pixels,
+            active_pixels_with_history=active_pixels_with_history,
+            basin_idx=basin_idx,
+            hist=hist,
+            cur_pixel_value=cur_pixel_value,
+            cur_pixel_accum=cur_pixel_accum,
+            current_basin_accumulation=current_basin_accumulation,
+            historical_basin_acc_threshold=historical_basin_accumulation_threshold,
+            efficient_alerts=efficient_alerts,
+            max_pixels_per_basin_output=max_pixels_per_basin_output,
+        )
+
+    operational_response_hr, operational_response_source = recover_operational_response_hr(
+        efficient_response_hr=efficient_alerts["historical_fastest_response_hr"],
+        hist=hist,
+        all_hist_idx=all_hist_idx,
+    )
+    operational_alert_level, operational_decision_reason = classify_operational_alert(
+        alert_level=alert_level,
+        response_hr=operational_response_hr,
+    )
+
+    basin_row = {
+        "state": state,
+        "site_id": site_id,
+        "alert_level": alert_level,
+        "alert_label": alert_level.title(),
+        "operational_alert_level": operational_alert_level,
+        "operational_alert_label": OPERATIONAL_ALERT_LABEL.get(operational_alert_level, operational_alert_level),
+        "operational_alert_color": OPERATIONAL_ALERT_COLOR.get(operational_alert_level, "#000000"),
+        "operational_decision_reason": operational_decision_reason,
+        "operational_response_hr": operational_response_hr,
+        "operational_response_source": operational_response_source,
+        "legacy_alert_level": legacy_alert_level,
+        "efficient_decision_reason": efficient_decision_reason,
+        "current_basin_accumulation": current_basin_accumulation,
+        "current_max_pixel_value": current_max_pixel_value,
+        "current_max_pixel_accumulation": current_max_pixel_accumulation,
+        "n_basin_pixels": n_basin_pixels,
+        "n_active_pixels": n_active_pixels,
+        "active_pixel_fraction": active_pixel_fraction,
+        "n_active_pixels_with_history": int(len(active_pixels_with_history)),
+        "historical_basin_accumulation_threshold": historical_basin_accumulation_threshold,
+        "basin_accumulation_reaches_history": bool(basin_accumulation_reaches_history),
+        "strong_threshold": strong_threshold,
+        "accumulation_quantile": accumulation_quantile,
+        **efficient_alerts,
+    }
+
+    return basin_row, pixel_records, False
+
+
+# =============================================================================
+# Multiprocessing wrappers
+# =============================================================================
+def _init_worker(
+    state: str,
+    basin_idx: dict,
+    hist: dict,
+    hist_lookup: dict[int, int],
+    efficient_ref: dict,
+    current_pixel_value_state: np.ndarray,
+    current_pixel_accum_state: np.ndarray,
+    strong_threshold: float,
+    k_matches: int,
+    accumulation_quantile: float,
+    severe_delta_threshold: float,
+    warning_delta_threshold: float,
+    max_pixels_per_basin_output: int | None,
+) -> None:
+    global _WORKER_STATE
+    _WORKER_STATE = {
+        "state": state,
+        "basin_idx": basin_idx,
+        "hist": hist,
+        "hist_lookup": hist_lookup,
+        "efficient_ref": efficient_ref,
+        "current_pixel_value_state": current_pixel_value_state,
+        "current_pixel_accum_state": current_pixel_accum_state,
+        "strong_threshold": strong_threshold,
+        "k_matches": k_matches,
+        "accumulation_quantile": accumulation_quantile,
+        "severe_delta_threshold": severe_delta_threshold,
+        "warning_delta_threshold": warning_delta_threshold,
+        "max_pixels_per_basin_output": max_pixels_per_basin_output,
+    }
+
+
+def _process_one_basin_from_worker_state(task: tuple[int, str]) -> tuple[int, dict | None, list[dict], bool]:
+    basin_i, site_id = task
+    basin_row, basin_pixel_records, skipped_normal = _process_one_basin(
+        basin_i=basin_i,
+        site_id=site_id,
+        state=_WORKER_STATE["state"],
+        basin_idx=_WORKER_STATE["basin_idx"],
+        hist=_WORKER_STATE["hist"],
+        hist_lookup=_WORKER_STATE["hist_lookup"],
+        efficient_ref=_WORKER_STATE["efficient_ref"],
+        current_pixel_value_state=_WORKER_STATE["current_pixel_value_state"],
+        current_pixel_accum_state=_WORKER_STATE["current_pixel_accum_state"],
+        strong_threshold=_WORKER_STATE["strong_threshold"],
+        k_matches=_WORKER_STATE["k_matches"],
+        accumulation_quantile=_WORKER_STATE["accumulation_quantile"],
+        severe_delta_threshold=_WORKER_STATE["severe_delta_threshold"],
+        warning_delta_threshold=_WORKER_STATE["warning_delta_threshold"],
+        max_pixels_per_basin_output=_WORKER_STATE["max_pixels_per_basin_output"],
+    )
+    return basin_i, basin_row, basin_pixel_records, skipped_normal
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+def compute_current_alerts_for_state(
+    *,
+    state: str,
+    current_rain_npz: Path,
+    state_basin_index_npz: Path,
+    pixel_event_index_npz: Path,
+    efficient_event_reference_npz: Path,
+    out_dir: Path,
+    strong_threshold: float = STRONG_RAIN_MM_H,
+    k_matches: int = 5,
+    accumulation_quantile: float = 0.00,
+    severe_delta_threshold: float = np.nan,
+    warning_delta_threshold: float = np.nan,
+    max_pixels_per_basin_output: int | None = None,
+    workers: int = 1,
+) -> dict[str, Path]:
+    """Compute current basin and pixel alerts for one state."""
+    t_total = perf_counter()
+
+    state = state.upper()
+    out_dir = Path(out_dir) / state
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    workers = max(1, int(workers))
+    if max_pixels_per_basin_output is None:
+        max_pixels_per_basin_output = DEFAULT_MAX_PIXELS_PER_BASIN_OUTPUT
+    if efficient_event_reference_npz is None:
+        raise ValueError("efficient_event_reference_npz is required")
+
+    print("=" * 100)
+    print("COMPUTE CURRENT ALERTS FOR STATE")
+    print("=" * 100)
+    print(f"state                         : {state}")
+    print(f"current_rain_npz              : {current_rain_npz}")
+    print(f"state_basin_index_npz         : {state_basin_index_npz}")
+    print(f"pixel_event_index_npz         : {pixel_event_index_npz}")
+    print(f"efficient_event_reference_npz : {efficient_event_reference_npz}")
+    print(f"out_dir                       : {out_dir}")
+    print(f"strong_threshold              : {strong_threshold}")
+    print(f"workers                       : {workers}")
+    print(f"max_pixels_per_basin_output   : {max_pixels_per_basin_output}")
+    print("classifier                    : pixel>=P90 and basin>=P75 => SEVERE; single extreme or weighted>=P75 => WARNING; weighted>=P50 => WATCH")
+    print("operational classifier        : SEVERE split by recovered response time; <=6h flash flood, >6h basin flood")
+    print("=" * 100)
+
+    t_load = perf_counter()
+    rain_data = load_current_state_rain(current_rain_npz)
+    basin_idx = load_state_basin_index(state_basin_index_npz)
+    hist = load_npz(pixel_event_index_npz)
+    efficient_ref = load_npz(efficient_event_reference_npz)
+    validate_efficient_reference(efficient_ref, basin_idx, state)
+
+    print(f"[TIMING] load inputs: {perf_counter() - t_load:.2f} seconds")
+    print(f"[CHECK] rain shape: {rain_data['rain'].shape}")
+    print(f"[CHECK] n_basins: {basin_idx['n_basins']:,}")
+    print(f"[CHECK] n_state_pixels: {basin_idx['n_state_pixels']:,}")
+    print(f"[CHECK] historical pixels for popup: {len(hist['pixel_id_state']):,}")
+    print(f"[CHECK] efficient ref sites: {len(efficient_ref['site_ids']):,}")
+    print(f"[CHECK] efficient ref events: {len(efficient_ref['pixel_ref']):,}")
+
+    rain = rain_data["rain"]
+    if rain.shape[1] != basin_idx["n_state_pixels"]:
+        raise ValueError(f"Rain n_state_pixels mismatch. rain={rain.shape[1]}, index={basin_idx['n_state_pixels']}")
+
+    t_preprocess = perf_counter()
+    rain = np.where(np.isfinite(rain) & (rain > 0), rain, 0.0).astype(np.float32, copy=False)
+    current_pixel_value_state = rain.max(axis=0).astype(np.float32)
+    current_pixel_accum_state = rain.sum(axis=0).astype(np.float32)
+    print(f"[TIMING] preprocess current rain: {perf_counter() - t_preprocess:.2f} seconds")
+    print(f"[CHECK] current max hourly pixel rain: {float(current_pixel_value_state.max()):.3f}")
+    print(f"[CHECK] current max accumulated pixel rain: {float(current_pixel_accum_state.max()):.3f}")
+    print(f"[CHECK] total accumulated state rain: {float(current_pixel_accum_state.sum()):.3f}")
+
+    t_lookup = perf_counter()
+    hist_lookup = build_event_lookup(hist)
+    print(f"[TIMING] build historical pixel lookup: {perf_counter() - t_lookup:.2f} seconds")
+    print(f"[CHECK] historical pixel lookup entries: {len(hist_lookup):,}")
+
+    site_ids = basin_idx["site_ids"].astype(str)
+    tasks = [(basin_i, str(site_id)) for basin_i, site_id in enumerate(site_ids)]
+
+    basin_rows = []
+    pixel_rows = []
+    skipped_normal_basins = 0
+    t_loop = perf_counter()
+
+    if workers <= 1:
+        print("[MODE] sequential basin processing")
+        for basin_i, site_id in tasks:
+            basin_row, basin_pixel_records, skipped_normal = _process_one_basin(
+                basin_i=basin_i,
+                site_id=site_id,
+                state=state,
+                basin_idx=basin_idx,
+                hist=hist,
+                hist_lookup=hist_lookup,
+                efficient_ref=efficient_ref,
+                current_pixel_value_state=current_pixel_value_state,
+                current_pixel_accum_state=current_pixel_accum_state,
+                strong_threshold=strong_threshold,
+                k_matches=k_matches,
+                accumulation_quantile=accumulation_quantile,
+                severe_delta_threshold=severe_delta_threshold,
+                warning_delta_threshold=warning_delta_threshold,
+                max_pixels_per_basin_output=max_pixels_per_basin_output,
+            )
+            if basin_row is not None:
+                basin_rows.append(basin_row)
+            if basin_pixel_records:
+                pixel_rows.extend(basin_pixel_records)
+            if skipped_normal:
+                skipped_normal_basins += 1
+            if (basin_i + 1) % 25 == 0 or (basin_i + 1) == len(site_ids):
+                print(
+                    f"[{basin_i + 1:5d}/{len(site_ids)}] basins processed | "
+                    f"pixel_alert_rows={len(pixel_rows):,} | fast_normal={skipped_normal_basins:,} | "
+                    f"elapsed_loop={perf_counter() - t_loop:.2f}s"
+                )
+    else:
+        print(f"[MODE] parallel basin processing with {workers} workers")
+        results_by_basin: list[tuple[int, dict | None, list[dict], bool]] = []
+        completed = 0
+        current_pixel_rows = 0
+        current_fast_normal = 0
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_worker,
+            initargs=(
+                state,
+                basin_idx,
+                hist,
+                hist_lookup,
+                efficient_ref,
+                current_pixel_value_state,
+                current_pixel_accum_state,
+                strong_threshold,
+                k_matches,
+                accumulation_quantile,
+                severe_delta_threshold,
+                warning_delta_threshold,
+                max_pixels_per_basin_output,
+            ),
+        ) as executor:
+            futures = [executor.submit(_process_one_basin_from_worker_state, task) for task in tasks]
+            for future in as_completed(futures):
+                result = future.result()
+                results_by_basin.append(result)
+                completed += 1
+                current_pixel_rows += len(result[2])
+                if result[3]:
+                    current_fast_normal += 1
+                if completed % 25 == 0 or completed == len(tasks):
+                    print(
+                        f"[{completed:5d}/{len(site_ids)}] basins completed | "
+                        f"pixel_alert_rows={current_pixel_rows:,} | fast_normal={current_fast_normal:,} | "
+                        f"elapsed_loop={perf_counter() - t_loop:.2f}s"
+                    )
+        results_by_basin.sort(key=lambda x: x[0])
+        for _, basin_row, basin_pixel_records, skipped_normal in results_by_basin:
+            if basin_row is not None:
+                basin_rows.append(basin_row)
+            if basin_pixel_records:
+                pixel_rows.extend(basin_pixel_records)
+            if skipped_normal:
+                skipped_normal_basins += 1
+
+    print(f"[TIMING] basin loop: {perf_counter() - t_loop:.2f} seconds")
+    print(f"[CHECK] basin rows: {len(basin_rows):,}")
+    print(f"[CHECK] pixel rows: {len(pixel_rows):,}")
+    print(f"[CHECK] fast normal basins: {skipped_normal_basins:,}")
+
+    t_dataframe = perf_counter()
+    basin_df = pd.DataFrame(basin_rows)
+    pixel_df = pd.DataFrame(pixel_rows)
+
+    if not basin_df.empty:
+        basin_df["alert_rank"] = basin_df["alert_level"].map(ALERT_RANK).fillna(0).astype(int)
+        basin_df["operational_alert_rank"] = basin_df["operational_alert_level"].map(OPERATIONAL_ALERT_RANK).fillna(0).astype(int)
+        basin_df = basin_df.sort_values(
+            ["operational_alert_rank", "alert_rank", "operational_response_hr", "efficient_weighted_percentile", "current_max_pixel_value"],
+            ascending=[False, False, True, False, False],
+        ).reset_index(drop=True)
+
+    if not pixel_df.empty:
+        pixel_df = pixel_df.sort_values(["current_pixel_accumulation", "current_pixel_value"], ascending=[False, False]).reset_index(drop=True)
+
+    print(f"[TIMING] build dataframes and sort: {perf_counter() - t_dataframe:.2f} seconds")
+    print(f"[CHECK] basin_df shape: {basin_df.shape}")
+    print(f"[CHECK] pixel_df shape: {pixel_df.shape}")
+
+    basin_parquet = out_dir / "basin_alerts.parquet"
+    basin_csv = out_dir / "basin_alerts.csv"
+    pixel_parquet = out_dir / "pixel_alerts.parquet"
+    pixel_csv = out_dir / "pixel_alerts.csv"
+
+    t_write = perf_counter()
+    basin_df.to_parquet(basin_parquet, index=False)
+    basin_df.to_csv(basin_csv, index=False)
+
+    if not pixel_df.empty:
+        pixel_df.to_parquet(pixel_parquet, index=False)
+        pixel_df.to_csv(pixel_csv, index=False)
+    else:
+        pd.DataFrame().to_parquet(pixel_parquet, index=False)
+        pd.DataFrame().to_csv(pixel_csv, index=False)
+    print(f"[TIMING] write outputs: {perf_counter() - t_write:.2f} seconds")
+
+    print("=" * 100)
+    print("DONE")
+    print("=" * 100)
+    print(f"basin alerts : {basin_parquet}")
+    print(f"pixel alerts : {pixel_parquet}")
+    print(f"fast normal basins skipped: {skipped_normal_basins:,}")
+
+    if not basin_df.empty:
+        print("\nALERT COUNTS")
+        print(basin_df["alert_level"].value_counts(dropna=False))
+
+        print("\nOPERATIONAL ALERT COUNTS")
+        print(basin_df["operational_alert_level"].value_counts(dropna=False))
+
+        print("\nOPERATIONAL RESPONSE SOURCES")
+        print(basin_df["operational_response_source"].value_counts(dropna=False))
+
+        print("\nOPERATIONAL DECISION REASONS")
+        print(basin_df["operational_decision_reason"].value_counts(dropna=False))
+
+        print("\nEFFICIENT DECISION REASONS")
+        print(basin_df["efficient_decision_reason"].value_counts(dropna=False))
+
+        cols_for_summary = [
+            "efficient_weighted_percentile",
+            "efficient_pixel_percentile",
+            "efficient_basin_percentile",
+            "current_basin_accumulation",
+            "current_max_pixel_accumulation",
+            "historical_fastest_response_hr",
+            "operational_response_hr",
+            "historical_fastest_delta_water_stage",
+            "active_pixel_fraction",
+        ]
+        existing_summary_cols = [c for c in cols_for_summary if c in basin_df.columns]
+        if existing_summary_cols:
+            print("\nNUMERIC SUMMARY")
+            print(basin_df[existing_summary_cols].describe().to_string())
+
+    print(f"pixel alert rows: {len(pixel_df):,}")
+    print(f"[TIMING] total runtime: {perf_counter() - t_total:.2f} seconds")
+
+    return {
+        "basin_alerts_parquet": basin_parquet,
+        "basin_alerts_csv": basin_csv,
+        "pixel_alerts_parquet": pixel_parquet,
+        "pixel_alerts_csv": pixel_csv,
+    }
