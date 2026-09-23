@@ -12,7 +12,7 @@ class PipelineConfig:
     """
 
     # Base output
-    base_dir: Path = Path("usgs_mrms_events_data").resolve()
+    base_dir: Path = Path("mrms_usgs_events_2m_data").resolve()
     # Logs (default: <base_dir>/logs)
     log_dir: Optional[Path] = None
     # Shared MRMS cache (default: <base_dir>/_mrms_cache)

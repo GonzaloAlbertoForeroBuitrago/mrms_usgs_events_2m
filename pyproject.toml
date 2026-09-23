@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "mrms-usgs-events"
-version = "0.1.3"
+name = "mrms-usgs-events-2m"
+version = "0.1.0"
 description = "Time-series peak extraction, basin delineation, state-level MRMS data download, and Zarr conversion."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,11 +50,11 @@ dependencies = [
 
 
 [project.urls]
-Repository = "https://github.com/GonzaloAlbertoForeroBuitrago/mrms_usgs_events"
+Repository = "https://github.com/GonzaloAlbertoForeroBuitrago/mrms_usgs_events_2m"
 
 
 [project.scripts]
-mrms-usgs = "mrms_usgs_events.cli:app"
+mrms-usgs-2m = "mrms_usgs_events_2m.cli:app"
 
 
 [tool.setuptools.packages.find]

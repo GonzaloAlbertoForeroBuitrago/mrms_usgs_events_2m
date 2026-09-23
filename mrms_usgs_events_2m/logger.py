@@ -87,7 +87,7 @@ def setup_logging(
     return paths
 
 
-def get_logger(name: str = "usgs_mrms_events") -> logging.Logger:
+def get_logger(name: str = "usgs_mrms_events_2m") -> logging.Logger:
     return logging.getLogger(name)
 
 
@@ -95,7 +95,7 @@ def site_logger(site_id: str, *, site_logs_dir: Path, level: int = logging.INFO)
     """
     Dedicated per-site logger writing to a site-specific file (safer for multi-process runs).
     """
-    lg = logging.getLogger(f"usgs_mrms_events.site.{site_id}")
+    lg = logging.getLogger(f"usgs_mrms_events_2m.site.{site_id}")
     lg.setLevel(level)
 
     if getattr(lg, "_configured", False):

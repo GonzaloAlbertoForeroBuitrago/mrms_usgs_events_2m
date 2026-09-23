@@ -23,7 +23,7 @@ def run_site_cmd(
     site_id: str = typer.Argument(..., help="USGS site id (digits or 'USGS-XXXXXXXX')."),
     start: str = typer.Option("2019-04-01", "--start", help="Start date (YYYY-MM-DD)."),
     end: str = typer.Option("2026-01-30", "--end", help="End date (YYYY-MM-DD)."),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir", help="Base output folder."),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir", help="Base output folder."),
     log_dir: Path | None = typer.Option(None, "--log-dir", help="Log folder (default: <base_dir>/logs)."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing outputs for this site."),
 ) -> None:
@@ -51,7 +51,7 @@ def run_many_cmd(
     sites_file: Path = typer.Argument(..., help="Text file with one site_id per line."),
     start: str = typer.Option("2019-04-01", "--start", help="Start date (YYYY-MM-DD)."),
     end: str = typer.Option("2026-01-30", "--end", help="End date (YYYY-MM-DD)."),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir", help="Base output folder."),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir", help="Base output folder."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing outputs per site."),
 ) -> None:
     """
@@ -121,7 +121,7 @@ def rain_manual_cmd(
     state: str = typer.Option(..., "--state"),
     start: str = typer.Option(..., "--start"),
     end: str = typer.Option(..., "--end"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
 ) -> None:
     cfg = PipelineConfig(base_dir=base_dir.resolve())
 
@@ -175,7 +175,7 @@ def rain_manual_parallel_cmd(
     state: str = typer.Option(..., "--state"),
     start: str = typer.Option(..., "--start"),
     end: str = typer.Option(..., "--end"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     workers: int = typer.Option(4, "--workers", help="Parallel hourly workers."),
 ) -> None:
     """
@@ -398,7 +398,7 @@ def rain_current_many_cmd(
     sites_file: Path = typer.Option(..., "--sites-file"),
     state: str = typer.Option(..., "--state"),
     hours_back: int = typer.Option(12, "--hours-back"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     site_workers: int = typer.Option(4, "--site-workers"),
     hour_workers: int = typer.Option(1, "--hour-workers"),
 ) -> None:
@@ -477,7 +477,7 @@ def rain_current_many_cmd(
 
 @masks_app.command("build-input")
 def masks_build_input_cmd(
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     basins_dir: Path | None = typer.Option(None, "--basins-dir"),
     out: Path | None = typer.Option(None, "--out"),
     overwrite: bool = typer.Option(False, "--overwrite"),
@@ -498,7 +498,7 @@ def masks_build_input_cmd(
 @masks_app.command("build-state-masks")
 def masks_build_state_masks_cmd(
     sample_grib_gz: Path = typer.Option(..., "--sample-grib-gz"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     mask_input: Path | None = typer.Option(None, "--mask-input"),
     out_dir: Path | None = typer.Option(None, "--out-dir"),
     state: str | None = typer.Option(None, "--state"),
@@ -524,7 +524,7 @@ def masks_build_state_masks_cmd(
 @masks_app.command("build-basin-masks")
 def masks_build_basin_masks_cmd(
     sample_grib_gz: Path = typer.Option(..., "--sample-grib-gz"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     mask_input: Path | None = typer.Option(None, "--mask-input"),
     out_dir: Path | None = typer.Option(None, "--out-dir"),
     dtype: str = typer.Option("float32", "--dtype"),
@@ -548,7 +548,7 @@ def masks_build_basin_masks_cmd(
 @masks_app.command("build-state-basin-index")
 def masks_build_state_basin_index_cmd(
     sample_grib_gz: Path = typer.Option(..., "--sample-grib-gz"),
-    base_dir: Path = typer.Option(Path("usgs_mrms_events_data"), "--base-dir"),
+    base_dir: Path = typer.Option(Path("mrms_usgs_events_2m_data"), "--base-dir"),
     mask_input: Path | None = typer.Option(None, "--mask-input"),
     state_mask_dir: Path | None = typer.Option(None, "--state-mask-dir"),
     out_dir: Path | None = typer.Option(None, "--out-dir"),

@@ -73,7 +73,7 @@ def download_single_site(
     site_id: str | int,
     start_date: str = "2019-04-01",
     end_date: str = "2026-01-30",
-    base_dir: str | Path = "usgs_mrms_events_data",
+    base_dir: str | Path = "mrms_usgs_events_2m_data",
     overwrite: bool = False,
     config: PipelineConfig | None = None,
 ) -> dict[str, Any]:
@@ -86,7 +86,7 @@ def download_single_site(
     """
     sid = normalize_site_id(site_id)
     if base_dir is None:
-        base_dir = Path("usgs_mrms_events_data").resolve()
+        base_dir = Path("mrms_usgs_events_2m_data").resolve()
     cfg = config or PipelineConfig(base_dir=Path(base_dir).resolve())
 
     setup_logging(log_dir=cfg.log_dir)
@@ -300,13 +300,13 @@ def download_many_sites(
     *,
     start_date: str = "2019-04-01",
     end_date: str = "2026-01-30",
-    base_dir: str | Path = "usgs_mrms_events_data",
+    base_dir: str | Path = "mrms_usgs_events_2m_data",
     overwrite: bool = False,
     config: PipelineConfig | None = None,
     workers: int | None = None,
 ) -> dict[str, int]:
     if base_dir is None:
-        base_dir = Path("usgs_mrms_events_data").resolve()
+        base_dir = Path("mrms_usgs_events_2m_data").resolve()
     cfg = config or PipelineConfig(base_dir=Path(base_dir).resolve())
     worker_count = workers or min(max(1, cfg.default_workers), cpu_count(), cfg.max_workers_cap)
 
