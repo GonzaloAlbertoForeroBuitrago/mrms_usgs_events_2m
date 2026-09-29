@@ -46,8 +46,8 @@ dependencies = [
   "Hydro-Event-Detector",
   "geopandas",
   "orjson",
+  "numpy",
 ]
-
 
 [project.urls]
 Repository = "https://github.com/GonzaloAlbertoForeroBuitrago/mrms_usgs_events_2m"
